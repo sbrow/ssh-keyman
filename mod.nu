@@ -38,11 +38,12 @@ export def "ssh-keyman local-keys" [
 
 export def "from ssh-keys" []: string -> table {
   lines
-  | where $it !~ '^\s*#'
+  | where $it !~ '^\s*(#.*)?$'
   | split column ' '
   | rename alg key name
-  | select alg key name
-  | move name --before alg
+  | select -i alg key name
+  # | parse pattern --regex '^(?<alg>[\w-]+) (?<key>[\w+\/=]+)(?: (?<name>[^\s]+))?'
+  # | move name --before alg
 }
 
 # List remote hosts that are known about.
@@ -78,4 +79,59 @@ def remote-keys [
   host: string # The host to connect to
 ]: nothing -> table {
   ssh $host 'cat ~/.ssh/authorized_keys' | from ssh-keys
+}
+
+export def "ssh-keyman remote-keys" [
+  ...hosts: string
+]: table -> table {
+  $hosts
+  | wrap host
+  | par-each {
+    insert keys { ssh $in.host 'cat ~/.ssh/authorized_keys' | from ssh-keys }
+  }
+}
+
+export def "ssh-keyman diff" [] {
+  let local_keys = ssh-keyman local-keys;
+
+  $in | update keys { |it|
+    $local_keys | each {
+      {
+        name: $in.name
+        installed: ($in.key in $it.keys.key)
+      }
+    } | sort-by -r name
+  }
+}
+
+# Use ssh-copy-id to deploy your keys to remote servers
+export def "ssh-keyman deploy-keys" []: table -> any {
+  let remotes = $in;
+
+  let identities = (
+    ssh-keyman local-keys
+    | input list -m 'Which keys would you like to install?'
+    | to ssh-keys
+  );
+
+  let identities_file = mktemp -t identity.XXX;
+
+  $identities | save -f $identities_file;
+  ln -s $identities_file $'($identities_file).pub'
+
+  print -e $identities;
+
+  if (
+    ['Continue' 'Cancel']
+    | input list $"The following keys will be installed.\n($identities)"
+    | $in == 'Continue'
+  ) {
+    $remotes | par-each {
+      ssh-copy-id -i $identities_file $in.host
+    }
+  }
+}
+
+def "to ssh-keys" [] {
+  to csv -ns ' '
 }
